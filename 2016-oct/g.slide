@@ -1,0 +1,179 @@
+Binary encoding, Flatbuffers and GRPC
+
+Manish R Jain, Dgraph Labs
+Oct 13, 2016
+Go Meetup Sydney
+manish@dgraph.io
+https://twitter.com/manishrjain
+
+* Pretext
+
+- At Dgraph, we aim to build a low latency, distributed graph database.
+- Data is distributed among nodes in the cluster.
+- To execute a query, multiple nodes need to communicate with each other.
+- Communication requires encoding and decoding of information.
+- We want to keep the latency and the memory usage involved in communication low.
+
+* Communication Protocols
+
+- Golang's `net/rpc` by default uses `encoding/gob`.
+- Default choice of grpc.io, Protocol Buffers, is the most popular choice.
+- gogo protobuf is a faster version of PBs, specifically for Go language; which can also work with grpc.io.
+
+* Flatbuffers
+
+- Flatbuffers, however, is the most efficient choice, created at Google for game development and other performance-critical applications.
+- What sets FlatBuffers apart is that it represents hierarchical data in a flat binary buffer in such a way that it can still be accessed directly without parsing/unpacking.
+- Flatbuffers doesn’t need to recreate the entire information in language specific data structures, which makes it faster than Protocol Buffers.
+- The only memory needed to access your data, is that of the serialized buffer.
+
+* Flatbuffers
+
+.code Query.go /^table Query/,/^}/
+.code Query.go /^func GetRootAsQuery/,/^}/
+.code Query.go /^func.*Init/,/^}/
+
+* Flatbuffers and net/rpc
+
+- Dgraph responses can contain millions of entities and binary blob values, and using FBs avoids allocating millions of Go data structures.
+- Dgraph uses Flatbuffers for all internal data representation and storage.
+.link https://google.github.io/flatbuffers/flatbuffers_benchmarks.html Flatbuffer Benchmarks
+- net/rpc uses encoding/gob by default.
+
+How do we make net/rpc work with Flatbuffers?
+
+- There's a way to specify custom encoding for net/rpc.
+
+* net/rpc Custom Encoding: Structs
+
+.code conn.go /type Query/,/^}/
+.code conn.go /type Reply/,/^}/
+
+* net/rpc Custom Encoding: Header
+
+.code conn.go /^func writeHeader/,/^}/
+
+* net/rpc Custom Encoding: Header
+
+.code conn.go /^func parseHeader/,/^}/
+
+* net/rpc Custom Encoding: Server Codec
+
+.code server.go /^type ServerCodec/,/^}/
+.code server.go /ReadRequestHeader/,/^}/
+.code server.go /ReadRequestBody/,/^}/
+
+* net/rpc Custom Encoding: Server Codec
+
+.code server.go /WriteResponse/,/^}/
+
+* net/rpc Custom Encoding: Client Codec
+
+.code client.go /^type ClientCodec/,/^}/
+.code client.go /WriteRequest/,/^}/
+
+* net/rpc Custom Encoding: Client Codec
+
+.code client.go /ReadResponseHeader/,/^}/
+.code client.go /ReadResponseBody/,/^}/
+
+* Connection Pool
+
+- We also need a connection pool at the client side to send requests to the server in parallel.
+
+.code pool.go /^type Pool/,/^}/
+.code pool.go /^func NewPool/,/^}/
+
+* Connection Pool
+
+.code pool.go /^func.*dialNew/,/^}/
+
+* Connection Pool
+
+.code pool.go /^func.*get/,/^}/
+
+* Connection Pool
+
+.code pool.go /^func.*Call/,/^}/
+.code pool.go /^func.*Close/,/^}/
+
+* net/rpc Custom Encoding: Summary
+
+- What does it do?
+
+Allow us to use Flatbuffers to RPC communication using go standard net/rpc.
+
+- Does it work?
+
+Yes! Dgraph used it for both v0.2 and v0.3 releases.
+
+* The Switch
+
+- Needed a way to track and surface slow RPCs.
+- Google had an amazing way internally to achieve this via Stubby, Google's proprietary RPC system.
+- Dave Cheney suggested checking out grpc.io, which we had rejected in the past because of it's reliance on Protocol Buffers.
+- But, Sameer Ajmani's talk pointed that grpc.io is a ground-up rewrite of Stubby, which got us to look deeper.
+
+* Jeff Dean's talk
+
+- Jeff Dean has an amazing talk about achieving consistent low latency in distributed systems.
+
+- Send request to the first replica, telling it that it’s going to send it to a second one.
+- 2 ms later, send the request to the second one, telling it that it’s already sent to the first one.
+- When one of them starts processing the request, it sends a cancellation request directly to its peer.
+- If the peer hasn’t started processing the request, it would just cancel the request.
+- In a rare case, both of them process it and do twice the work.
+- Overall, your latencies improve considerably due to this method.
+
+* Contexts
+
+- Achieving what Jeff Dean proposed would require quite a bit of code.
+- And more code to track slow RPCs.
+- Contexts, give you all of this for free.
+- Cancelling a pending request is as simple as calling a cancel() function, via contexts.
+- trace.Trace: /debug/requests
+- trace.EventLog: /debug/events
+.link https://godoc.org/golang.org/x/net/trace
+
+* Flatbuffers?
+
+- Switching to grpc.io seemed like a win for all it's benefits.
+- But, we didn't want to give up on Flatbuffers.
+- That's when we found that grpc.io has custom encoding support.
+
+* Protocol Definitions
+
+.code def.proto
+
+* grpc.io Custom Encoding
+
+.code grpc.go /^type PayloadCodec/,/^}/
+.code grpc.go /^func.*Unmarshal/,/^}/
+.code grpc.go /^func.*String/,/^}/
+
+* Connection Pool
+
+.code grpc.go /^func.*dialNew/,/^}/
+.code grpc.go /^func.*Get/,/^}/
+.code grpc.go /^func.*Put/,/^}/
+
+* grpc.io Usage
+
+.code usage.go /^func send/,/^}/
+
+* Conclusion
+
+GRPC not only does custom encoding, but it also leads to:
+
+- smaller code footprint.
+- context, which in turn allows client to cancel pending rpc requests to servers, among many other benefits.
+- net/trace, which allows tracing of rpcs and long-lived objects.
+
+* Relevant Links
+
+.link https://open.dgraph.io/post/rpc-vs-grpc/ Original Dgraph Blog Post
+.link https://github.com/dgraph-io/dgraph/commit/c4629b907702748694712637cbef1fb2c1f15d07 Dgraph Commit to switch from net/rpc to grpc with custom encoding
+.link http://static.googleusercontent.com/media/research.google.com/en//people/jeff/Berkeley-Latency-Mar2012.pdf Jeff Dean presentation
+.link https://blog.golang.org/context Blog post on Contexts by Sameer Ajmani
+.link https://talks.golang.org/2014/gotham-context.slide#1 Presentation by Sameer Ajmani
+
